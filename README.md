@@ -1,69 +1,92 @@
-# 长对话的开窗优化：从30秒到2秒
+# Long-Conversation Open-Window Optimization: From 30 Seconds to 2
 
-当一个AI对话窗口堆积了几百条消息时，打开它就成了一次性能灾难——浏览器要解析、布局、绘制所有DOM节点，渲染时间可以从几秒膨胀到半分钟。主流方案是虚拟滚动（Virtual Scrolling），只渲染视口内可见的元素。但虚拟滚动会杀死浏览器原生搜索（Cmd+F）、破坏滚动位置、并且在可变高度内容上极其难以调教。
+English · [中文](README.zh-CN.md)
 
-这篇笔记记录了一种替代方案：所有消息都存在于DOM中，但通过 `content-visibility` + 分层懒加载 + 定点DOM替换让浏览器跳过不可见内容的渲染。从30秒降到2秒，不依赖任何库。格式为原生JS + CSS，保留浏览器全部原生能力。
+When an AI chat window has accumulated a few hundred messages, opening it becomes a performance disaster — the browser parses, lays out, and paints every DOM node, and render time balloons from a few seconds to half a minute. The mainstream answer is virtual scrolling: render only the elements visible in the viewport. But virtual scrolling kills the browser's native search (Cmd+F), breaks scroll positions, and is notoriously hard to tame with variable-height content.
 
-> *前置条件*  本文假设你已经有一个能渲染消息列表的聊天前端——不管是用框架还是原生JS。核心思路和具体框架无关：`content-visibility` 是CSS属性，`IntersectionObserver` 是浏览器API，`DocumentFragment` 是DOM接口。你在React里做还是在原生JS里做只影响写法，不影响原理。
+These notes describe an alternative: every message stays in the DOM, but `content-visibility` + tiered lazy rendering + surgical DOM replacement let the browser skip everything that can't be seen. Open time drops from 30 seconds to 2, with no libraries. Native JS + CSS, keeping every native browser capability.
 
-1. [开窗为什么慢](#problem)
-2. [一行CSS解决大部分问题](#content-visibility)
-3. [两层渲染：壳子和真身](#two-tier)
-4. [三个 IntersectionObserver](#observers)
-5. [定点DOM替换](#surgical)
-6. [滚动位置校正](#scroll)
-7. [和虚拟滚动的对比](#vs-virtual)
-8. [注意事项摘要](#summary)
+> *Prerequisite*  This article assumes you already have a chat frontend that renders a message list — framework or vanilla. The core ideas are framework-agnostic: `content-visibility` is a CSS property, `IntersectionObserver` is a browser API, `DocumentFragment` is a DOM interface. React versus vanilla only changes the spelling, not the principle.
 
-## 1 开窗为什么慢
+## Strategy overview
 
-一条消息的DOM结构通常包含：头像、用户名、时间戳、消息正文（可能包含Markdown渲染后的HTML）、图片、代码块、分支导航箭头。一条消息的DOM子节点数量在10到50之间。当对话窗口有500条消息时，DOM节点总数在5000到25000之间。
+**This article (open-window optimization)**
 
-浏览器渲染这些节点分三步：
+- **content-visibility + contain-intrinsic-size** — one line of CSS skips layout and paint for off-viewport messages while keeping the DOM intact ([§2](#2-one-line-of-css-does-most-of-the-work))
+- **Two-tier rendering** — the last 8 messages get full builds; every older message gets a 3-node featherweight shell, hydrated by an IntersectionObserver 600px before it scrolls into view ([§3](#3-two-tier-rendering-shells-and-full-messages))
+- **Image lazy loading** — a 1×1 transparent pixel placeholder; the real request fires within 300px of the viewport; the only strategy here that needs the backend's help ([§4](#4-three-intersectionobservers))
+- **Lazy Markdown rendering (optional)** — the minimal alternative when you don't want shells ([§4](#4-three-intersectionobservers))
+- **Surgical replacement** — edit/retry `replaceWith`s exactly one element; pin its top edge back, force visible to skip the "birth frame" ([§5](#5-surgical-dom-replacement))
+- **The scroll-correction trio** — a ResizeObserver writes real heights back; a scroll anchor detects and corrects drift; pinBottom holds the floor after opening and lets go the instant a gesture arrives ([§6](#6-scroll-position-correction))
+
+**[The nonlinear companion](nonlinear-rendering.md)**
+
+- **renderDiff** — branch switches tear down and rebuild only what's past the divergence point; the shared prefix is never touched
+- **Temporary content-visibility override** — streaming tails and flip anchors get forced visible for honest measurements
+- **Navigator anchoring** — branch flips pin the message's bottom edge in place so the ‹ › arrows stay under the user's finger
+- **DOM slots** — every opened conversation keeps a hidden container; switching back re-renders nothing
+- **Where this applies** — which layers survive deeper trees / DAGs / multi-column views
+
+## Contents
+
+1. [Why opening is slow](#1-why-opening-is-slow)
+2. [One line of CSS does most of the work](#2-one-line-of-css-does-most-of-the-work)
+3. [Two-tier rendering: shells and full messages](#3-two-tier-rendering-shells-and-full-messages)
+4. [Three IntersectionObservers](#4-three-intersectionobservers)
+5. [Surgical DOM replacement](#5-surgical-dom-replacement)
+6. [Scroll position correction](#6-scroll-position-correction)
+7. [Versus virtual scrolling](#7-versus-virtual-scrolling)
+8. [Checklist](#8-checklist)
+
+## 1 Why opening is slow
+
+A message's DOM typically contains: avatar, username, timestamp, body (possibly Markdown-rendered HTML), images, code blocks, branch-navigation arrows. One message runs 10–50 DOM nodes. A 500-message window totals 5,000–25,000 nodes.
+
+The browser renders them in three steps:
 
 ```text
-Parse      构建DOM树和CSSOM树
-Layout     计算每个节点的尺寸和位置
-Paint      把像素画到屏幕上
+Parse      build the DOM and CSSOM trees
+Layout     compute every node's size and position
+Paint      put pixels on screen
 ```
 
-三步全部作用于所有节点——包括那些远在视口之外、用户根本看不见的。对于一个500条消息的窗口，浏览器在打开的瞬间尝试对两万多个节点做一次完整的布局和绘制。**用户等了30秒，但只看到最底下的几条消息。**上面那499条的布局和绘制全是浪费。
+All three apply to every node — including the ones far outside the viewport that the user cannot see. For a 500-message window, the browser attempts a full layout and paint over twenty-odd thousand nodes the moment it opens. **The user waits 30 seconds and sees only the last few messages.** The layout and paint of the other 499 was pure waste.
 
-解决思路很直觉——既然用户只看得见底部，就只渲染底部。问题是怎么做。
+The fix is intuitive — since the user only sees the bottom, render only the bottom. The question is how.
 
-## 2 一行CSS解决大部分问题
+## 2 One line of CSS does most of the work
 
-`content-visibility: auto` 是一个CSS属性，它告诉浏览器：如果这个元素不在视口附近，跳过它的布局和绘制。元素仍然存在于DOM中——可以被 `Cmd+F` 搜到、被JavaScript访问——但浏览器不花时间计算它的样式和位置。
+`content-visibility: auto` is a CSS property that tells the browser: if this element isn't near the viewport, skip its layout and paint. The element stays in the DOM — findable by `Cmd+F`, reachable from JavaScript — but the browser spends no time computing its style and position.
 
-```js
+```css
 .msg {
   content-visibility: auto;
   contain-intrinsic-size: auto 400px;
 }
 ```
 
-两行。第一行开启按需渲染。第二行给浏览器一个高度估算值——在元素还没被真正布局之前，浏览器用 `400px` 作为它的预估高度来计算滚动条。`auto` 关键字的含义是：如果浏览器之前已经渲染过这个元素并记住了它的真实高度，就用真实值；否则用 `400px`。
+Two lines. The first turns on render-on-demand. The second hands the browser a height estimate — before the element has ever been laid out, the browser assumes `400px` when sizing the scrollbar. The `auto` keyword means: if the browser has rendered this element before and remembers its real height, use that; otherwise use `400px`.
 
-这行CSS解决了大部分渲染性能问题。500条消息的窗口，浏览器只对视口附近的十几条做完整布局和绘制，其余的全部跳过。打开窗口的时间从30秒降到3秒左右。
+This one rule solves most of the rendering cost. In a 500-message window the browser fully lays out and paints only the dozen-odd messages near the viewport and skips everything else. Open time drops from 30 seconds to about 3.
 
-> **为什么不是虚拟滚动？** `content-visibility: auto` 和虚拟滚动解决的是同一个问题（不渲染不可见的内容），但实现方式完全不同。虚拟滚动从DOM中删除不可见元素然后回收利用；`content-visibility` 把元素留在DOM中只是告诉浏览器别画。前者是删除，后者是隐身。隐身保留了所有浏览器原生能力——搜索、滚动条、选中文字、无障碍访问。
+> **Why not virtual scrolling?** `content-visibility: auto` and virtual scrolling attack the same problem (don't render what can't be seen) in completely different ways. Virtual scrolling deletes invisible elements from the DOM and recycles their nodes; `content-visibility` leaves elements in the DOM and just tells the browser not to draw them. One is deletion, the other is invisibility. Invisibility keeps every native browser capability — search, scrollbar, text selection, accessibility.
 
-## 3 两层渲染：壳子和真身
+## 3 Two-tier rendering: shells and full messages
 
-`content-visibility` 跳过了布局和绘制，但没有跳过DOM构建。500条消息的完整DOM仍然需要被创建——包括Markdown转HTML、代码块语法高亮、图片标签——即使它们不会被画出来。这个DOM构建过程本身就需要时间。
+`content-visibility` skips layout and paint, but not DOM construction. The full DOM of all 500 messages still has to be built — Markdown-to-HTML, code highlighting, image tags — even if none of it will be painted. That construction takes real time by itself.
 
-解决方法：把消息分成两层。
+The fix: split messages into two tiers.
 
 ```text
-                        ┌─────────────────────┐
-    500条消息的路径      │  前492条  →  壳子    │  mkLazyMsg()
-                        │  后8条    →  真身    │  mkUser() / mkAI()
-                        └─────────────────────┘
+                      ┌───────────────────────────┐
+  a 500-message path  │ first 492  →  shells      │  mkLazyMsg()
+                      │ last 8     →  full builds │  mkUser() / mkAI()
+                      └───────────────────────────┘
 ```
 
-**真身**：最后8条消息（用户当前正在看的部分），使用完整的消息构建函数渲染——Markdown解析、代码高亮、图片、所有交互元素。这8条立刻可见可用。
+**Full messages**: the last 8 (the part the user is actually looking at), built with the complete constructors — Markdown parsing, code highlighting, images, every interactive element. These 8 are visible and usable immediately.
 
-**壳子**：前面所有旧消息，只构建一个极轻的占位符。一个 `<div class="msg">` 里面放一个100字的纯文本预览，30%透明度。不做Markdown渲染、不构建交互元素、不请求图片。占位符的DOM节点数从30+降到3个。
+**Shells**: every older message gets only a featherweight placeholder — a `<div class="msg">` holding a 100-character plain-text preview at 30% opacity. No Markdown, no interactive elements, no image requests. Node count per placeholder drops from 30+ to 3.
 
 ```js
 function mkLazyMsg(node) {
@@ -71,19 +94,19 @@ function mkLazyMsg(node) {
   el.className = 'msg msg-lazy';
   el.dataset.id = node.id;
 
-  // 只放一段纯文本预览，不做任何渲染
+  // A plain-text preview only — no rendering of any kind
   const preview = (node.content || '').slice(0, 100);
   el.innerHTML = `<div class="msg-preview" style="opacity:0.3">${escapeHtml(preview)}</div>`;
 
-  // 把完整数据存在Map里，等滚到附近再构建
+  // Park the full data in a Map; build when scrolled near
   lazyMsgData.set(node.id, node);
-  lazyMsgHydrator.observe(el);   // 交给 Observer 1 盯着（第4节）——漏掉这行，壳子永远不会水合
+  lazyMsgHydrator.observe(el);   // hand it to Observer 1 (§4) — omit this line and shells never hydrate
 
   return el;
 }
 ```
 
-开窗时的渲染流程：
+The opening render flow:
 
 ```js
 function renderAll(pathNodes) {
@@ -91,7 +114,7 @@ function renderAll(pathNodes) {
   const tail = pathNodes.slice(-TAIL);
   const older = pathNodes.slice(0, -TAIL);
 
-  // 1. 先渲染尾部真身，用 DocumentFragment 批量插入
+  // 1. Render the tail first, batch-inserted via DocumentFragment
   const frag = document.createDocumentFragment();
   for (const node of tail) {
     frag.appendChild(node.role === 'user' ? mkUser(node) : mkAI(node));
@@ -99,29 +122,29 @@ function renderAll(pathNodes) {
   container.appendChild(frag);
   container.scrollTop = container.scrollHeight;
 
-  // 2. 再渲染旧消息的壳子，prepend 到顶部
+  // 2. Then prepend shells for the older messages
   const fragOlder = document.createDocumentFragment();
   for (const node of older) {
     fragOlder.appendChild(mkLazyMsg(node));
   }
   const scrollBefore = container.scrollHeight;
   container.prepend(fragOlder);
-  // 补偿滚动位置——prepend 改变了滚动高度
+  // Compensate the scroll position — prepend changed scrollHeight
   container.scrollBy(0, container.scrollHeight - scrollBefore);
 }
 ```
 
-先插尾部、再 prepend 旧消息，是为了让用户先看到最新内容。旧消息的壳子插入后不会触发可见区域的重绘（因为它们都在视口上方），加上 `content-visibility: auto`，浏览器也不会对它们做布局。
+Tail first, shells prepended after, so the user sees the newest content first. Inserting the shells doesn't repaint the visible region (they all land above the viewport), and with `content-visibility: auto` the browser doesn't lay them out either.
 
-> **为什么是8条？** 视口通常能容纳5到10条消息。8条保证了最下面的可见区域被完整覆盖。这个数字取决于你的消息平均高度和视口尺寸——太少会在底部露出壳子，太多会增加初始渲染时间。
+> **Why 8?** A viewport typically fits 5–10 messages. Eight guarantees the visible bottom region is fully covered. The number depends on your average message height and viewport size — too few exposes shells at the bottom, too many inflates the initial render.
 
-## 4 三个 IntersectionObserver
+## 4 Three IntersectionObservers
 
-壳子不能永远是壳子。用户往上滚的时候，那些30%透明度的文字预览应该被替换成完整的消息。这件事交给 `IntersectionObserver`——浏览器原生的"元素进入视口"检测器。
+A shell can't stay a shell. As the user scrolls up, those 30%-opacity text previews should become full messages. That's a job for `IntersectionObserver` — the browser's native "element entered the viewport" detector.
 
-### Observer 1：消息水合
+### Observer 1: message hydration
 
-当壳子元素进入视口附近600px范围时，把它替换成完整渲染的真身。
+When a shell comes within 600px of the viewport, replace it with a fully rendered message.
 
 ```js
 const lazyMsgHydrator = new IntersectionObserver(entries => {
@@ -132,71 +155,71 @@ const lazyMsgHydrator = new IntersectionObserver(entries => {
     const node = lazyMsgData.get(id);
     if (!node) continue;
 
-    // 构建完整消息DOM
+    // Build the full message DOM
     const full = node.role === 'user' ? mkUser(node) : mkAI(node);
-    el.replaceWith(full);          // 一次性替换
-    lazyMsgData.delete(id);    // 释放数据引用
-    lazyMsgHydrator.unobserve(el); // 不再观察
+    el.replaceWith(full);          // one-shot replacement
+    lazyMsgData.delete(id);        // release the data reference
+    lazyMsgHydrator.unobserve(el); // stop observing
   }
 }, { rootMargin: '600px 0px' });
 ```
 
-`rootMargin: '600px 0px'` 让触发范围扩大到视口上下各600px。用户在滚动到某条消息之前的一屏距离，它就已经被水合完了。用户不会看到壳子替换成真身的闪烁。
+`rootMargin: '600px 0px'` widens the trigger zone to 600px above and below the viewport. A message finishes hydrating a screenful before the user reaches it — the shell-to-full swap never flickers in view.
 
-### Observer 2：Markdown懒渲染
+### Observer 2: lazy Markdown rendering
 
-Markdown转HTML是有成本的——包含代码块的长消息的解析时间不可忽略。对于已经水合的消息，它的正文部分可以先放原始文本，等进入视口再做Markdown渲染。
+Markdown-to-HTML has a cost — the parse time of a long message with code blocks is not negligible. For an already-hydrated message, the body can start as raw text and get its Markdown pass only when it nears the viewport.
 
 ```js
 const lazyObserver = new IntersectionObserver(entries => {
   for (const entry of entries) {
     if (!entry.isIntersecting) continue;
     const el = entry.target;
-    el.innerHTML = md(el.dataset.lazyMd);   // 此时才解析Markdown
+    el.innerHTML = md(el.dataset.lazyMd);   // parse Markdown only now
     delete el.dataset.lazyMd;
     lazyObserver.unobserve(el);
   }
 }, { rootMargin: '600px 0px' });
 ```
 
-> **这一层是可选的。**它诞生在两层渲染（第3节）之前——当年所有消息都完整构建，Markdown解析是首屏最大的开销之一，把它推迟到进视口才做很划算。有了壳子之后，旧消息的Markdown解析本来就发生在水合那一刻（进入视口附近600px时），这一层没有独立的活儿可干了——本文的原型实现后来退役了它。做了两层渲染就可以跳过这层；只想最小改动、不想引入壳子的话，单独用它也能省下一大块首屏解析时间。
+> **This tier is optional.** It predates two-tier rendering (§3) — back when every message was fully built, Markdown parsing was one of the biggest first-paint costs, and deferring it paid off handsomely. With shells, an old message's Markdown parse already happens at hydration time (600px out), and this tier has no independent job left — our prototype eventually retired it. If you've built two-tier rendering, skip this tier; if you want the minimal change and no shells, this tier alone still buys back a big slice of first-paint parse time.
 
-### Observer 3：图片懒加载
+### Observer 3: image lazy loading
 
-对话中的图片不应该在开窗时一起加载——一个窗口里可能有几十张图片，每张都是一个HTTP请求。图片的 `src` 先设成1×1透明像素，进入视口附近300px时再设成真实URL。
+Images in a conversation should not load when the window opens — one window can hold dozens, each its own HTTP request. Set the image's `src` to a 1×1 transparent pixel first; when it comes within 300px of the viewport, set the real URL.
 
 ```js
 const lazyImgObserver = new IntersectionObserver(entries => {
   for (const entry of entries) {
     if (!entry.isIntersecting) continue;
     const img = entry.target;
-    img.src = img.dataset.lazySrc;   // 此时才请求图片
+    img.src = img.dataset.lazySrc;   // request the image only now
     lazyImgObserver.unobserve(img);
   }
 }, { rootMargin: '300px 0px' });
 ```
 
-三个Observer各自独立，职责不重叠：
+The three observers are independent, with no overlapping duties:
 
 ```text
-Observer 1  rootMargin 600px   壳子 → 真身
-Observer 2  rootMargin 600px   原始文本 → Markdown HTML（可选）
-Observer 3  rootMargin 300px   透明像素 → 真实图片
+Observer 1  rootMargin 600px   shell → full message
+Observer 2  rootMargin 600px   raw text → Markdown HTML (optional)
+Observer 3  rootMargin 300px   transparent pixel → real image
 ```
 
-图片Observer的rootMargin比消息Observer小，因为图片加载涉及网络请求，太早触发会浪费带宽；但300px通常足够在用户滚到图片位置之前完成加载。
+The image observer's rootMargin is smaller than the message observers' because image loading costs network requests — triggering too early wastes bandwidth — and 300px is usually enough to finish loading before the user scrolls to the image.
 
-> **这一条需要后端搭一半手。**本文其余策略都是纯前端，唯独图片懒加载有个前提：得先有"真实URL"可设。如果你的图片本来就是URL（对象存储、静态文件），前端部分就够了。但如果图片是以base64内联在会话数据里的，光换占位符没用——几MB的图片字节仍然跟着开窗请求下载，省掉的只有解码和绘制。要吃到全部收益，后端要做**载荷瘦身**：会话接口把图片块替换成轻存根（块索引+媒体类型，不带数据），另开一个按块取图的端点，前端滚近时才请求。配套一道守卫：若客户端保存时会把整条消息数组回传，落盘前必须用磁盘上的正本还原存根——否则存根会覆盖真数据。
+> **This one needs the backend to carry half.** Every other strategy in this article is frontend-only; image lazy loading has a prerequisite: there must be a "real URL" to set. If your images are already URLs (object storage, static files), the frontend part is all you need. But if images ride inline as base64 in the conversation payload, swapping in placeholders buys nothing — megabytes of image bytes still download with the open-window request; all you save is decode and paint. To collect the full win, the backend must put the payload on a diet: the conversation endpoint replaces image blocks with light stubs (block index + media type, no data), and a per-block image endpoint serves the bytes when the frontend asks. Ship one guard with it: if clients echo whole message arrays back on save, restore the stubs from the stored copy before writing to disk — otherwise a stub can overwrite real data.
 
-## 5 定点DOM替换
+## 5 Surgical DOM replacement
 
-开窗渲染只发生一次。之后的交互——编辑消息、重试AI回复——不应该重新渲染整个窗口。
+The opening render happens once. The interactions after it — editing a message, retrying an AI reply — must not re-render the whole window.
 
-> 如果你的对话支持树形分支，切换分支时还需要一个 `renderDiff`——找到新旧路径的分歧点，只替换分歧点之后的DOM。这部分的渲染优化在[非线性会话的渲染优化](nonlinear-rendering.zh-CN.md)中展开。
+> If your conversations support tree branching, switching branches also needs a `renderDiff` — find where the old and new paths diverge and replace only the DOM past that point. That part is covered in [Rendering optimization for nonlinear conversations](nonlinear-rendering.md).
 
-### swapMsgEl：单条替换
+### swapMsgEl: replacing a single message
 
-编辑或重试时，只有一条消息变了。找到那条消息的DOM元素，构建新的，`replaceWith`。补偿滚动时钉的是**新元素的顶边**，不是高度差——用户正看着这条消息，要保住的是它此刻在屏幕上的位置；按高度差补偿，消息还在视口里时反而会把正在看的内容推走。
+On edit or retry, exactly one message changed. Find that message's DOM element, build the new one, `replaceWith`. The scroll compensation pins **the new element's top edge**, not the height delta — the user is looking at this message, and what must survive is its position on screen; compensating by height delta shoves the content being read whenever the message is still inside the viewport.
 
 ```js
 function swapMsgEl(node) {
@@ -204,7 +227,7 @@ function swapMsgEl(node) {
   if (!stale) return;
 
   const fresh = node.role === 'user' ? mkUser(node) : mkAI(node);
-  // 出生即在视口内——跳过 content-visibility 的400px"出生帧"
+  // Born in-viewport — skip content-visibility's 400px "birth frame"
   fresh.style.contentVisibility = 'visible';
 
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
@@ -212,26 +235,26 @@ function swapMsgEl(node) {
   stale.replaceWith(fresh);
 
   if (nearBottom) {
-    // 正贴底跟读——替换后直接钉回底部（塌缩没完时交给 pinBottom，见第6节）
+    // Following the bottom — re-pin the floor after the swap (hand off to pinBottom (§6) if still settling)
     container.scrollTop = container.scrollHeight;
   } else {
-    // 在中间阅读——把新元素的顶边钉回原位，视口纹丝不动
+    // Reading mid-window — pin the new element's top edge back; the viewport must not move
     container.scrollBy(0, fresh.getBoundingClientRect().top - topBefore);
   }
 }
 ```
 
-两个容易踩的坑。**出生帧**：新建的元素带着 `content-visibility: auto` 和400px的估算高度进入DOM，浏览器要到下一帧才判定它"在视口内"，这一帧里它以估算高度参与布局，肉眼可见地跳一下。既然已知它出生就在视口里，直接标 `visible` 跳过判定。**视口上方的替换**：如果被替换的消息在视口上方，它的顶边没动，但高度变化会把下面的内容整体推移——这类漂移不归 `swapMsgEl` 管，交给第6节的 scroll anchor 修正。两套机制各管一段，拼起来才是完整的"不跳"。
+Two traps worth naming. **The birth frame**: a freshly built element enters the DOM carrying `content-visibility: auto` and the 400px estimate; the browser doesn't classify it as "in viewport" until the next frame, so for one frame it participates in layout at the estimated height — a visible jump. Since you already know it's born on screen, mark it `visible` and skip the classification. **Replacements above the viewport**: if the replaced message sits above the viewport, its top edge doesn't move, but its height change shifts everything below it — that class of drift is not `swapMsgEl`'s job; the scroll anchor of §6 corrects it. Each mechanism owns one segment; together they add up to "nothing jumps."
 
-> **为什么不用虚拟DOM diffing？** 虚拟DOM（React等框架的做法）通过比较新旧虚拟树来最小化真实DOM操作。但对于消息列表这种场景，我们已经知道哪条消息变了——不需要diffing算法来"发现"变化。直接 `replaceWith` 比任何diffing都快，因为它跳过了比较步骤。
+> **Why not virtual-DOM diffing?** Virtual DOM (the React-family approach) minimizes real DOM operations by comparing new and old virtual trees. But in a message list we already know which message changed — no diffing algorithm is needed to "discover" it. A direct `replaceWith` beats any diff, because it skips the comparison entirely.
 
-## 6 滚动位置校正
+## 6 Scroll position correction
 
-`content-visibility: auto` 有一个副作用：当浏览器对一个之前没渲染过的元素做首次布局时，元素的真实高度几乎一定和预估的 `400px` 不同。高度变化会导致滚动位置跳动——用户正在看的那条消息突然上移或下移了几十像素。
+`content-visibility: auto` has a side effect: when the browser first lays out an element it has never rendered, the real height almost never equals the `400px` estimate. The height change moves the scroll position — the message the user is reading suddenly jumps up or down by tens of pixels.
 
-解决这个问题需要三个零件：
+Fixing this takes three parts:
 
-### ResizeObserver：把真实高度写回去
+### ResizeObserver: write the real height back
 
 ```js
 const msgHeightObserver = new ResizeObserver(entries => {
@@ -243,18 +266,18 @@ const msgHeightObserver = new ResizeObserver(entries => {
 });
 ```
 
-每当一条消息被渲染并计算出真实高度后，`ResizeObserver` 把那个高度写回 `contain-intrinsic-size`。下次这条消息离开视口，浏览器跳过它的布局时，用的就是真实高度而非 `400px` 的猜测。`h > 0` 的守卫防止隐藏中或刚脱离文档的元素把 `0` 写进估算值。
+Whenever a message is rendered and its real height computed, the `ResizeObserver` writes that height back into `contain-intrinsic-size`. The next time this message leaves the viewport and the browser skips its layout, it uses the real height instead of the `400px` guess. The `h > 0` guard keeps hidden or just-detached elements from poisoning the estimate with `0`.
 
-### Scroll Anchor：检测并修正漂移
+### Scroll anchor: detect and correct drift
 
 ```js
 let scrollAnchorEl = null;
 let scrollAnchorOff = 0;
 
 function updateScrollAnchor() {
-  // 贴底跟读时不设锚——那时底部才是位置权威
+  // No anchor while following the bottom — there, the floor is the position authority
   if (atBottom()) { scrollAnchorEl = null; return; }
-  // 记住视口顶部第一条可见消息，和它相对滚动位置的偏移
+  // Remember the first visible message at the top of the viewport, and its offset from the scroll position
   const st = container.scrollTop;
   for (const m of container.querySelectorAll('.msg')) {
     if (m.offsetTop + m.offsetHeight > st) {
@@ -267,10 +290,11 @@ function updateScrollAnchor() {
 }
 container.addEventListener('scroll', updateScrollAnchor);
 
-// ResizeObserver 回调中修正漂移
+// Inside the ResizeObserver callback — correct drift
 if (scrollAnchorEl && !scrollAnchorEl.isConnected) {
-  // 锚点消息刚被 replaceWith 换掉——脱离文档的节点 offsetTop 读出来是0，
-  // 照着它算漂移会把视口甩出几千像素。重新从活DOM里选锚。
+  // The anchored message was just replaceWith'd — a detached node reads offsetTop 0,
+  // and drift math against it would fling the viewport thousands of pixels.
+  // Re-pick the anchor from the live DOM.
   updateScrollAnchor();
 }
 if (scrollAnchorEl && !atBottom()) {
@@ -279,77 +303,81 @@ if (scrollAnchorEl && !atBottom()) {
 }
 ```
 
-偏移量用 `offsetTop - scrollTop`（相对滚动容器）而不是 `getBoundingClientRect().top`（相对视口）——软键盘弹起、页面级布局变化会移动容器本身，前者不受牵连。锚选视口顶部第一条可见消息而非中央：修正的目标是"正在读的那行不动"，读的起点在视口上沿。
+The offset uses `offsetTop - scrollTop` (relative to the scroll container) rather than `getBoundingClientRect().top` (relative to the viewport) — a software keyboard or a page-level layout shift moves the container itself, and the former doesn't care. The anchor is the first visible message at the top of the viewport, not the middle: the goal is "the line being read doesn't move," and reading starts at the top edge.
 
-> *锚点会被 replaceWith 杀死*  本文有多处 `replaceWith`：壳子水合（第4节）、定点替换（第5节）。哪一次换掉的恰好是锚点消息，锚就指向了一个脱离文档的死节点。两道保险都要上：替换的地方顺手把锚转移到新元素（在 Observer 1 和 `swapMsgEl` 里加一句 `if (scrollAnchorEl === el) scrollAnchorEl = full;`），修正漂移前再用 `isConnected` 兜底重选。漏掉这层，水合一条旧消息就可能把视口甩飞——这是锚点方案最隐蔽的坑。
+> *replaceWith kills anchors*  This article calls `replaceWith` in several places: shell hydration (§4) and surgical replacement (§5). Whenever the element replaced happens to be the anchor, the anchor now points at a detached, dead node. Ship both guards: transfer the anchor at the replacement site (one line in Observer 1 and `swapMsgEl`: `if (scrollAnchorEl === el) scrollAnchorEl = full;`), and re-pick with an `isConnected` check before correcting drift. Miss this layer and hydrating one old message can fling the viewport — the most hidden trap in the anchor scheme.
 
-### pinBottom：开窗后钉住底部
+### pinBottom: hold the floor after opening
 
-开窗的前几秒，大量壳子被水合、`content-visibility` 的预估高度被修正，滚动高度在持续变化。一个 `requestAnimationFrame` 循环在这段时间内持续把视口钉在底部：
+For the first seconds after opening, shells hydrate in bulk and `content-visibility` estimates get corrected — the scroll height keeps changing. A `requestAnimationFrame` loop keeps the viewport pinned to the bottom through the turbulence:
 
 ```js
 function pinBottom() {
   const gestures = ['wheel', 'touchstart', 'mousedown'];
   let stopped = false;
   const stop = () => { stopped = true; gestures.forEach(ev => window.removeEventListener(ev, stop)); };
-  // 退出条件一：真实手势一来，立刻松手——绝不和用户抢滚动条
+  // Exit 1: a real gesture arrives — let go instantly; never fight the user for the scrollbar
   gestures.forEach(ev => window.addEventListener(ev, stop, { passive: true }));
 
   const t0 = performance.now();
   let calmSince = null;
   (function tick() {
     if (stopped) return;
-    scrollAnchorEl = null;   // 钉底期间，底部是唯一的位置权威
+    scrollAnchorEl = null;   // while pinned, the floor is the only position authority
     const dist = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (dist > 1) {
       container.scrollTop = container.scrollHeight;
-      calmSince = null;      // 还在塌缩，重新计时
+      calmSince = null;      // still collapsing — restart the calm timer
     } else if (calmSince === null) {
       calmSince = performance.now();
     }
     const now = performance.now();
-    // 退出条件二：布局静止满1秒（至少钉5秒，等晚到的图片）
-    // 退出条件三：15秒硬上限兜底
+    // Exit 2: layout calm for a full second (after a 5s minimum, for late-arriving images)
+    // Exit 3: 15s hard cap
     if ((now - t0 > 5000 && calmSince !== null && now - calmSince > 1000) || now - t0 > 15000) { stop(); return; }
     requestAnimationFrame(tick);
   })();
 }
 
-// 开窗后钉住底部，等高度塌缩稳定
+// Pin the floor after opening; wait out the height collapse
 pinBottom();
 ```
 
-三个退出条件里最重要的是第一个：**手势一来立刻松手**。固定时长、不可打断的钉底循环会和用户抢滚动条——用户往上滚，循环每帧把视口拽回底部，一抢就是十几秒。钉底期间清空 `scrollAnchorEl` 也是同一件事：锚点修正、钉底、贴底跟读是三个都想说了算的"位置权威"，同一时刻只能有一个在岗，否则它们互相拉扯视口。松手之后，scroll anchor 机制自然接管漂移校正。
+Of the three exit conditions, the one that matters most is the first: **let go the instant a gesture arrives**. A fixed-duration, uninterruptible pin loop fights the user for the scrollbar — they scroll up, the loop drags the viewport back to the bottom every frame, for fifteen seconds straight. Clearing `scrollAnchorEl` while pinned is the same idea: anchor correction, bottom pinning, and bottom-following are three "position authorities" that all want the wheel, and only one may hold it at a time — otherwise they tear the viewport apart. Once the pin lets go, the scroll anchor takes over drift correction naturally.
 
-## 7 和虚拟滚动的对比
+## 7 Versus virtual scrolling
 
-虚拟滚动（react-virtualized、tanstack virtual、vue-virtual-scroller 等）的做法是**只在DOM中保留视口内可见的元素**，滚出视口的元素被从DOM中移除、它们的DOM节点被回收给新进入视口的元素使用。一套生死轮回。
+Virtual scrolling (react-virtualized, TanStack Virtual, vue-virtual-scroller, …) keeps **only the visible elements in the DOM**; elements scrolled out are removed, their DOM nodes recycled for elements scrolling in. A wheel of death and rebirth.
 
-本文的做法是**所有元素都在DOM中**，只是不可见的不被浏览器渲染。
+This article keeps **every element in the DOM** — the invisible ones just aren't rendered by the browser.
 
-| | 虚拟滚动 | content-visibility |
+| | Virtual scrolling | content-visibility |
 |---|---|---|
-| DOM节点数 | 视口内 + 缓冲区 | 全部（含壳子） |
-| Cmd+F 原生搜索 | 不可用 | 可用 |
-| 滚动条 | 人工计算高度 | 浏览器原生 |
-| 可变高度支持 | 需要复杂的高度缓存 | 浏览器自动处理 |
-| 元素状态保留 | 滚出即丢失 | 始终保留 |
-| 内存占用 | 低 | 略高（百条级别可忽略） |
-| 复杂度 | 高（需要管理回收池） | 低（CSS + 3个Observer） |
+| DOM node count | viewport + buffer | all (shells included) |
+| Native Cmd+F search | broken | works |
+| Scrollbar | hand-computed heights | browser-native |
+| Variable heights | needs elaborate height caches | browser handles it |
+| Element state | lost on scroll-out | always retained |
+| Memory | low | slightly higher (negligible at hundreds) |
+| Complexity | high (recycling pool to manage) | low (CSS + 3 observers) |
 
-**虚拟滚动更适合**万级以上的超长列表——聊天记录导出、日志查看器——DOM节点数量本身成为内存瓶颈的场景。
+**Virtual scrolling fits** lists from the tens of thousands up — chat exports, log viewers — where DOM node count itself becomes the memory bottleneck.
 
-**`content-visibility` 更适合**百级到千级的对话窗口——消息数量大到裸渲染卡死，但没大到DOM节点本身吃光内存。在这个区间里，它用一行CSS和几个Observer就拿到了虚拟滚动需要一个库才能实现的性能，同时保留了所有浏览器原生能力。
+**`content-visibility` fits** conversation windows from the hundreds to the low thousands — enough messages that naive rendering chokes, not enough that DOM nodes eat your memory. In that range, one line of CSS and a few observers buy the performance virtual scrolling needs an entire library to deliver, while keeping every native browser capability.
 
-## 8 注意事项摘要
+## 8 Checklist
 
-1. **`content-visibility: auto` 是基础。**它告诉浏览器跳过不可见元素的布局和绘制，保留DOM的完整性。`contain-intrinsic-size` 给浏览器一个高度估算，避免滚动条在渲染前后剧烈跳动。
-2. **两层渲染拆快慢。**尾部几条完整渲染，其余用壳子占位。壳子被 `IntersectionObserver` 水合成真身。
-3. **图片永远懒加载。**初始为1×1透明像素，进入视口附近才请求。
-4. **编辑/重试用 `replaceWith`，只替换那一个元素。**新元素标 `content-visibility: visible` 免出生帧；贴底时钉底，其余时候把新元素的顶边钉回原位。分支切换的定点替换见[非线性会话篇](nonlinear-rendering.zh-CN.md)。
-5. **滚动位置校正三件套：**`ResizeObserver` 写回真实高度、scroll anchor 检测漂移并修正（锚点被 `replaceWith` 换掉时要转移或重选）、`pinBottom` 在开窗初期钉住底部（手势一来立刻松手）。三者是互斥的位置权威，同一时刻只能有一个在岗。
-6. **不要同时开两个渲染路径。**打开新窗口时，复用之前的DOM slot，不要销毁再重建。切回一个之前打开过的对话时，那个slot的DOM还在，直接激活。
+1. **`content-visibility: auto` is the foundation.** It tells the browser to skip layout and paint for invisible elements while preserving the full DOM. `contain-intrinsic-size` supplies a height estimate so the scrollbar doesn't convulse between pre- and post-render.
+2. **Two-tier rendering splits fast from slow.** The last few messages render in full; the rest are shell placeholders, hydrated into full messages by an `IntersectionObserver`.
+3. **Images always lazy-load.** Start as a 1×1 transparent pixel; request only near the viewport.
+4. **Edit/retry uses `replaceWith` on exactly one element.** Mark the new element `content-visibility: visible` to skip the birth frame; pin the floor when at the bottom, otherwise pin the new element's top edge back in place. For branch switches, see [the nonlinear companion](nonlinear-rendering.md).
+5. **The scroll-correction trio:** `ResizeObserver` writes real heights back; the scroll anchor detects and corrects drift (transfer or re-pick the anchor when it gets `replaceWith`'d); `pinBottom` holds the floor right after opening (and lets go the instant a gesture arrives). The three are mutually exclusive position authorities — only one on duty at a time.
+6. **Never run two render paths at once.** Opening a window reuses its previous DOM slot instead of destroying and rebuilding. Switching back to a previously opened conversation finds its slot's DOM still warm — just activate it.
 
-2026 · 08 · 01
+---
 
-Architecture & documentation: Opus 4.6
+8.1 First edition: main article + nonlinear companion + snippets.
+
+8.1 Second-pass review: fixed TOC anchors and cross-links; added the strategy overview; anchor hand-off added to snippets; English edition. — fable5
+
+<sub>Architecture & documentation: Opus 4.6 · Second-pass review & English translation: Fable 5</sub>

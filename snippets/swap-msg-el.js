@@ -9,6 +9,7 @@ function swapMsgEl(node) {
   const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
   const topBefore = stale.getBoundingClientRect().top;
   stale.replaceWith(fresh);
+  if (scrollAnchorEl === stale) scrollAnchorEl = fresh; // keep the scroll anchor alive across the swap
 
   if (nearBottom) {
     container.scrollTop = container.scrollHeight;

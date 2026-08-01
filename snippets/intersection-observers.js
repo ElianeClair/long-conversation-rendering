@@ -9,6 +9,7 @@ const lazyMsgHydrator = new IntersectionObserver(entries => {
 
     const full = node.role === 'user' ? mkUser(node) : mkAI(node);
     el.replaceWith(full);
+    if (scrollAnchorEl === el) scrollAnchorEl = full; // keep the scroll anchor alive across the swap
     lazyMsgData.delete(id);
     lazyMsgHydrator.unobserve(el);
   }
