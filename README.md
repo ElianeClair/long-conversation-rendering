@@ -1,6 +1,6 @@
 # Long-Conversation Open-Window Optimization: From 30 Seconds to 2
 
-English · [中文](README.zh-CN.md)
+[中文原文](README.zh-CN.md)
 
 When an AI chat window has accumulated a few hundred messages, opening it becomes a performance disaster — the browser parses, lays out, and paints every DOM node, and render time balloons from a few seconds to half a minute. The mainstream answer is virtual scrolling: render only the elements visible in the viewport. But virtual scrolling kills the browser's native search (Cmd+F), breaks scroll positions, and is notoriously hard to tame with variable-height content.
 

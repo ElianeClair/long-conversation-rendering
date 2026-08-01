@@ -1,6 +1,6 @@
 # Rendering Optimization for Nonlinear Conversations
 
-English · [中文](nonlinear-rendering.zh-CN.md)
+[中文原文](nonlinear-rendering.zh-CN.md)
 
 In a tree-branching conversation, the user can fork at any point, backtrack, and switch between paths. Every branch switch updates the message list on screen — but must not re-render the whole window. These notes cover surgical DOM replacement on branch switches, navigator anchoring, and DOM reuse across conversations.
 
