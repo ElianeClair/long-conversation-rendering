@@ -375,6 +375,7 @@ This article keeps **every element in the DOM** — the invisible ones just aren
 6. **Never run two render paths at once.** Opening a window reuses its previous DOM slot instead of destroying and rebuilding. Switching back to a previously opened conversation finds its slot's DOM still warm — just activate it.
 
 ---
+.177...
 
 8.1 First edition: main article + nonlinear companion + snippets.
 
