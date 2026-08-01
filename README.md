@@ -1,10 +1,10 @@
-# Long-Conversation Open-Window Optimization: From 30 Seconds to 2
+# Long-Conversation Open-Window Optimization
 
 [中文原文](README.zh-CN.md)
 
-When an AI chat window has accumulated a few hundred messages, opening it becomes a performance disaster — the browser parses, lays out, and paints every DOM node, and render time balloons from a few seconds to half a minute. The mainstream answer is virtual scrolling: render only the elements visible in the viewport. But virtual scrolling kills the browser's native search (Cmd+F), breaks scroll positions, and is notoriously hard to tame with variable-height content.
+When an AI chat window has accumulated a few hundred messages, opening it becomes a performance disaster — the browser parses, lays out, and paints every DOM node, and render time balloons from a few seconds to tens of seconds — or minutes. The mainstream answer is virtual scrolling: render only the elements visible in the viewport. But virtual scrolling kills the browser's native search (Cmd+F), breaks scroll positions, and is notoriously hard to tame with variable-height content.
 
-These notes describe an alternative: every message stays in the DOM, but `content-visibility` + tiered lazy rendering + surgical DOM replacement let the browser skip everything that can't be seen. Open time drops from 30 seconds to 2, with no libraries. Native JS + CSS, keeping every native browser capability.
+These notes describe an alternative: every message stays in the DOM, but `content-visibility` + tiered lazy rendering + surgical DOM replacement let the browser skip everything that can't be seen. It pulls the rendering cost down from the tens-of-seconds-to-minutes range into second-level territory, with no libraries. Native JS + CSS, keeping every native browser capability.
 
 > *Prerequisite*  This article assumes you already have a chat frontend that renders a message list — framework or vanilla. The core ideas are framework-agnostic: `content-visibility` is a CSS property, `IntersectionObserver` is a browser API, `DocumentFragment` is a DOM interface. React versus vanilla only changes the spelling, not the principle.
 
@@ -50,7 +50,7 @@ Layout     compute every node's size and position
 Paint      put pixels on screen
 ```
 
-All three apply to every node — including the ones far outside the viewport that the user cannot see. For a 500-message window, the browser attempts a full layout and paint over twenty-odd thousand nodes the moment it opens. **The user waits 30 seconds and sees only the last few messages.** The layout and paint of the other 499 was pure waste.
+All three apply to every node — including the ones far outside the viewport that the user cannot see. For a 500-message window, the browser attempts a full layout and paint over twenty-odd thousand nodes the moment it opens. **The user waits tens of seconds and sees only the last few messages.** The layout and paint of the other 499 was pure waste.
 
 The fix is intuitive — since the user only sees the bottom, render only the bottom. The question is how.
 
@@ -67,7 +67,7 @@ The fix is intuitive — since the user only sees the bottom, render only the bo
 
 Two lines. The first turns on render-on-demand. The second hands the browser a height estimate — before the element has ever been laid out, the browser assumes `400px` when sizing the scrollbar. The `auto` keyword means: if the browser has rendered this element before and remembers its real height, use that; otherwise use `400px`.
 
-This one rule solves most of the rendering cost. In a 500-message window the browser fully lays out and paints only the dozen-odd messages near the viewport and skips everything else. Open time drops from 30 seconds to about 3.
+This one rule solves most of the rendering cost. In a 500-message window the browser fully lays out and paints only the dozen-odd messages near the viewport and skips everything else. This step alone drops the open time by an order of magnitude.
 
 > **Why not virtual scrolling?** `content-visibility: auto` and virtual scrolling attack the same problem (don't render what can't be seen) in completely different ways. Virtual scrolling deletes invisible elements from the DOM and recycles their nodes; `content-visibility` leaves elements in the DOM and just tells the browser not to draw them. One is deletion, the other is invisibility. Invisibility keeps every native browser capability — search, scrollbar, text selection, accessibility.
 
@@ -380,5 +380,7 @@ This article keeps **every element in the DOM** — the invisible ones just aren
 8.1 First edition: main article + nonlinear companion + snippets.
 
 8.1 Second-pass review: fixed TOC anchors and cross-links; added the strategy overview; anchor hand-off added to snippets; English edition. — fable5
+
+8.1 Retired the specific second-counts from title and body (never actually measured); orders of magnitude until we instrument. — fable5
 
 <sub>Architecture & documentation: Opus 4.6 · Second-pass review & English translation: Fable 5</sub>

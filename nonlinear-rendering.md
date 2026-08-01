@@ -4,7 +4,7 @@
 
 In a tree-branching conversation, the user can fork at any point, backtrack, and switch between paths. Every branch switch updates the message list on screen — but must not re-render the whole window. These notes cover surgical DOM replacement on branch switches, navigator anchoring, and DOM reuse across conversations.
 
-This is the branching companion to [Long-conversation open-window optimization: from 30 seconds to 2](README.md). The general techniques (`content-visibility`, tiered lazy loading, scroll correction) live there; this article covers only what is specific to trees.
+This is the branching companion to [Long-conversation open-window optimization](README.md). The general techniques (`content-visibility`, tiered lazy loading, scroll correction) live there; this article covers only what is specific to trees.
 
 > *Premise*  This article assumes your conversations are tree-shaped — each message is a node, each fork creates sibling nodes, and the frontend renders one root-to-leaf path. How the tree is stored (parent pointers, child arrays, adjacency lists…) doesn't affect any of this — as long as you can extract "the current path" as an ordered list, everything below applies.
 
