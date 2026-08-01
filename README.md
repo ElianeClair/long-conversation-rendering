@@ -192,7 +192,7 @@ Observer 3  rootMargin 300px   透明像素 → 真实图片
 
 开窗渲染只发生一次。之后的交互——编辑消息、重试AI回复——不应该重新渲染整个窗口。
 
-> 如果你的对话支持树形分支，切换分支时还需要一个 `renderDiff`——找到新旧路径的分歧点，只替换分歧点之后的DOM。这部分的渲染优化在[非线性会话的渲染优化](/nonlinear-rendering.html)中展开。
+> 如果你的对话支持树形分支，切换分支时还需要一个 `renderDiff`——找到新旧路径的分歧点，只替换分歧点之后的DOM。这部分的渲染优化在[非线性会话的渲染优化](nonlinear-rendering.zh-CN.md)中展开。
 
 ### swapMsgEl：单条替换
 
@@ -346,7 +346,7 @@ pinBottom();
 1. **`content-visibility: auto` 是基础。**它告诉浏览器跳过不可见元素的布局和绘制，保留DOM的完整性。`contain-intrinsic-size` 给浏览器一个高度估算，避免滚动条在渲染前后剧烈跳动。
 2. **两层渲染拆快慢。**尾部几条完整渲染，其余用壳子占位。壳子被 `IntersectionObserver` 水合成真身。
 3. **图片永远懒加载。**初始为1×1透明像素，进入视口附近才请求。
-4. **编辑/重试用 `replaceWith`，只替换那一个元素。**新元素标 `content-visibility: visible` 免出生帧；贴底时钉底，其余时候把新元素的顶边钉回原位。分支切换的定点替换见[非线性会话篇](/nonlinear-rendering.html)。
+4. **编辑/重试用 `replaceWith`，只替换那一个元素。**新元素标 `content-visibility: visible` 免出生帧；贴底时钉底，其余时候把新元素的顶边钉回原位。分支切换的定点替换见[非线性会话篇](nonlinear-rendering.zh-CN.md)。
 5. **滚动位置校正三件套：**`ResizeObserver` 写回真实高度、scroll anchor 检测漂移并修正（锚点被 `replaceWith` 换掉时要转移或重选）、`pinBottom` 在开窗初期钉住底部（手势一来立刻松手）。三者是互斥的位置权威，同一时刻只能有一个在岗。
 6. **不要同时开两个渲染路径。**打开新窗口时，复用之前的DOM slot，不要销毁再重建。切回一个之前打开过的对话时，那个slot的DOM还在，直接激活。
 
